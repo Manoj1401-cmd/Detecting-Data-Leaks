@@ -1,0 +1,5 @@
+sql_injection_demo/
+│
+├── app.py               # Main application logic
+├── database.db          # SQLite database (auto-generated)
+├── setup_db.py          # Creates users table and inserts sample data
