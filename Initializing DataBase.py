@@ -21,4 +21,5 @@ c.executemany('INSERT INTO users (username, password) VALUES (?, ?)', [
 
 conn.commit()
 conn.close()
-print("✅ Database initialized.")
+print("Database initialized.")
+
