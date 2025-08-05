@@ -20,6 +20,7 @@ username = "Manoj"
 password = "' OR '1'='1"
 
 if vulnerable_login(username, password):
-    print("🚨 Access Granted – Data Leak Possible!")
+    print("Access Granted – Data Leak Possible!")
 else:
-    print("⛔ Access Denied")
+    print("Access Denied")
+
