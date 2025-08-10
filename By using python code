@@ -1,0 +1,274 @@
+import os
+import re
+import json
+import secrets
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Set, Tuple
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Util.Padding import pad, unpad
+import hashlib
+import socket
+import socketserver
+import threading
+from enum import Enum, auto
+
+# Security Configuration
+AES_ALGORITHM = 'aes-256-cbc'
+ITERATION_COUNT = 65536
+KEY_LENGTH = 32  # 256 bits
+SYSTEM_SALT = b'fixedSystemSalt123'  # In production, store securely
+IV_LENGTH = 16  # AES block size is 16 bytes
+
+# SQL Injection Patterns
+SQL_INJECTION_PATTERNS = [
+    re.compile(r'(?i).*\b(union|select|insert|update|delete|drop|alter|create|truncate)\b.*'),
+    re.compile(r'([\'";]+.*([\'";]+|(--|#|/\*).*))'),
+    re.compile(r'\b(and|or)\b.+=\d+$', re.IGNORECASE),
+    re.compile(r'\b(exec|execute|xp_cmdshell)\b', re.IGNORECASE)
+]
+
+# Capability Tokens store
+capability_tokens: Dict[str, 'Capability'] = {}
+token_lock = threading.Lock()
+
+# Database connection
+DB_FILE = 'secure_db.sqlite'
+conn: Optional[sqlite3.Connection] = None
+
+class Permission(Enum):
+    READ = auto()
+    WRITE = auto()
+    QUERY = auto()
+    ADMIN = auto()
+
+class Capability:
+    def __init__(self, user_id: str, expiry_time: float, permissions: Set[Permission]):
+        self.user_id = user_id
+        self.expiry_time = expiry_time
+        self.permissions = permissions
+
+def initialize_database():
+    """Initialize the secure database with users table and sample data"""
+    global conn
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    
+    # Enable WAL mode for better concurrency
+    conn.execute("PRAGMA journal_mode=WAL")
+    
+    # Create users table if not exists
+    conn.execute('''CREATE TABLE IF NOT EXISTS users
+             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              username TEXT UNIQUE NOT NULL,
+              password_hash TEXT NOT NULL,
+              encrypted_data TEXT)''')
+    
+    # Create sample user if none exists
+    cursor = conn.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        # Default admin user password is "secure123"
+        salt = secrets.token_bytes(16)
+        key = derive_encryption_key("secure123", salt)
+        encrypted_pwd = encrypt_data("secure123", key)
+        conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                    ("admin", encrypted_pwd))
+        conn.commit()
+
+def derive_encryption_key(password: str, salt: bytes) -> bytes:
+    """Derive a secure encryption key from password and salt"""
+    return PBKDF2(password.encode(), salt, dkLen=KEY_LENGTH, count=ITERATION_COUNT,
+                 hmac_hash_module=hashlib.sha256)
+
+def encrypt_data(data: str, key: bytes) -> str:
+    """Encrypt data using AES-256-CBC"""
+    iv = os.urandom(IV_LENGTH)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_data = pad(data.encode('utf-8'), AES.block_size)
+    encrypted = cipher.encrypt(padded_data)
+    return f"{iv.hex()}:{encrypted.hex()}"
+
+def decrypt_data(encrypted_data: str, key: bytes) -> str:
+    """Decrypt data using AES-256-CBC"""
+    iv_hex, data_hex = encrypted_data.split(':')
+    iv = bytes.fromhex(iv_hex)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    decrypted = cipher.decrypt(bytes.fromhex(data_hex))
+    return unpad(decrypted, AES.block_size).decode('utf-8')
+
+def generate_secure_token() -> str:
+    """Generate a secure random token for capabilities"""
+    return secrets.token_urlsafe(32)
+
+def detect_sql_injection(input_str: str) -> bool:
+    """Check for SQL injection patterns in input"""
+    # Check for common injection patterns
+    for pattern in SQL_INJECTION_PATTERNS:
+        if pattern.search(input_str):
+            return True
+    
+    # Check for uncommon encoding attempts
+    if any(seq in input_str for seq in ["%27", "%3B", "0x", "/*", "*/", "--", "#"]):
+        return True
+    
+    return False
+
+def verify_capability_token(token: str) -> Optional[Capability]:
+    """Verify a capability token and check expiry"""
+    with token_lock:
+        cap = capability_tokens.get(token)
+        if cap is None:
+            return None
+        
+        if datetime.now().timestamp() > cap.expiry_time:
+            del capability_tokens[token]
+            return None
+        
+        return cap
+
+def authenticate_user(username: str, password: str) -> Optional[str]:
+    """Authenticate user and return capability token if successful"""
+    cursor = conn.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    result = cursor.fetchone()
+    if not result:
+        return None
+    
+    stored_hash = result[0]
+    
+    # In a real system, we'd use proper password hashing like Argon2 or bcrypt
+    # This is a simplified version for demonstration
+    key = derive_encryption_key(password, SYSTEM_SALT)
+    provided_hash = hashlib.sha256(password.encode()).hexdigest()
+    
+    # Compare hashes in constant time
+    if not secrets.compare_digest(stored_hash, encrypt_data(provided_hash, key)):
+        return None
+    
+    # Generate capability token
+    token = generate_secure_token()
+    expiry_time = (datetime.now() + timedelta(hours=1)).timestamp()
+    
+    with token_lock:
+        capability_tokens[token] = Capability(
+            username, expiry_time, 
+            {Permission.READ, Permission.QUERY, Permission.WRITE}
+        )
+    
+    return token
+
+def execute_secure_query(token: str, query: str, params: Tuple = ()) -> List[Dict]:
+    """Execute a secured parameterized query"""
+    cap = verify_capability_token(token)
+    if not cap:
+        raise PermissionError("Invalid or expired capability token")
+    
+    if Permission.QUERY not in cap.permissions:
+        raise PermissionError("Insufficient permissions")
+    
+    if detect_sql_injection(query):
+        log_security_event("SQL Injection Attempt", query, cap.user_id)
+        raise ValueError("Potential SQL injection detected")
+    
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, params)
+        
+        if query.lstrip().upper().startswith("SELECT"):
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        conn.commit()
+        return []
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
+
+def log_security_event(event_type: str, details: str, user_id: str = "system"):
+    """Log security-related events"""
+    timestamp = datetime.now().isoformat()
+    log_entry = f"{timestamp} - {event_type} - User: {user_id} - Details: {details}\n"
+    
+    with open("security.log", "a") as f:
+        f.write(log_entry)
+
+class SecureRequestHandler(socketserver.BaseRequestHandler):
+    """Handle secure TCP connections for the database gateway"""
+    
+    def handle(self):
+        try:
+            data = self.request.recv(4096).decode('utf-8').strip()
+            if not data:
+                return
+            
+            try:
+                request = json.loads(data)
+            except json.JSONDecodeError:
+                self.send_error("Invalid JSON format")
+                return
+            
+            if 'action' not in request:
+                self.send_error("Missing action")
+                return
+            
+            if request['action'] == 'authenticate':
+                if 'username' not in request or 'password' not in request:
+                    self.send_error("Missing credentials")
+                    return
+                
+                token = authenticate_user(request['username'], request['password'])
+                if not token:
+                    self.send_error("Authentication failed")
+                    return
+                
+                self.send_success({'token': token})
+                return
+            
+            if 'token' not in request:
+                self.send_error("Missing capability token")
+                return
+            
+            if request['action'] == 'query':
+                if 'sql' not in request:
+                    self.send_error("Missing SQL query")
+                    return
+                
+                params = request.get('params', ())
+                
+                try:
+                    results = execute_secure_query(request['token'], request['sql'], params)
+                    self.send_success({'results': results})
+                except Exception as e:
+                    self.send_error(str(e))
+                return
+            
+            self.send_error("Unknown action")
+            
+        except Exception as e:
+            self.send_error(f"Internal error: {str(e)}")
+    
+    def send_response(self, success: bool, data: Dict):
+        response = {'success': success, **data}
+        self.request.sendall(json.dumps(response).encode('utf-8'))
+    
+    def send_success(self, data: Dict = {}):
+        self.send_response(True, data)
+    
+    def send_error(self, message: str):
+        self.send_response(False, {'error': message})
+
+def start_secure_server(port: int = 8080):
+    """Start the secure database gateway server"""
+    initialize_database()
+    
+    with socketserver.ThreadingTCPServer(("0.0.0.0", port), SecureRequestHandler) as server:
+        print(f"Secure SQL Gateway running on port {port}")
+        server.serve_forever()
+
+if __name__ == "__main__":
+    start_secure_server()
+
+
