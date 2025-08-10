@@ -1,0 +1,26 @@
+import requests
+import json
+
+# Authenticate
+auth = requests.post('http://localhost:8080', json={
+    'action': 'authenticate',
+    'username': 'admin',
+    'password': 'secure123'
+}).json()
+
+if not auth.get('success'):
+    print("Authentication failed:", auth.get('error'))
+    exit()
+
+token = auth['token']
+
+# Execute secure query
+query = {
+    'action': 'query',
+    'token': token,
+    'sql': "SELECT * FROM users WHERE username = ?",
+    'params': ['admin']
+}
+
+response = requests.post('http://localhost:8080', json=query).json()
+print("Query results:", json.dumps(response, indent=2))
